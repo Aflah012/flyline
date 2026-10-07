@@ -982,14 +982,25 @@ impl<'a> App<'a> {
             }
 
             let is_idle = self.last_activity_time.elapsed() >= IDLE_TIMEOUT;
-            let effective_fps = if is_idle {
-                crate::settings()
-                    .idle_frame_rate
-                    .min(crate::settings().frame_rate as f64)
+            let is_termux = std::env::var_os("TERMUX_VERSION").is_some()
+                    || std::path::Path::new("/data/data/com.termux").exists();
+            let (effective_fps, force_periodic_redraw) = if is_termux {
+                (0.05, false)
+            } else if is_idle {
+                (
+                    crate::settings()
+                        .idle_frame_rate
+                        .min(crate::settings().frame_rate as f64),
+                    true,
+                )
             } else {
-                crate::settings().frame_rate as f64
+                (crate::settings().frame_rate as f64, true)
             };
-            let min_refresh_rate: Duration = Duration::from_millis((1000.0 / effective_fps) as u64);
+            let min_refresh_rate: Duration = if is_termux {
+                Duration::from_secs(3600)
+            } else {
+                Duration::from_millis((1000.0 / effective_fps) as u64)
+            };
 
             redraw = match poll_terminal_event(&event_reader, min_refresh_rate) {
                 Ok(Some(event)) => {
@@ -1151,7 +1162,9 @@ impl<'a> App<'a> {
                         _ => false,
                     }
                 }
-                Ok(None) => true,
+                Ok(None) => {
+                    if is_termux { false } else { true }
+                },
                 Err(err) => {
                     log::info!(
                         "Terminal input problem, setting mode to exiting with EOF: {}",
@@ -1162,7 +1175,8 @@ impl<'a> App<'a> {
                 }
             };
 
-            if std::time::Instant::now().duration_since(self.last_draw_time) > min_refresh_rate {
+            if force_periodic_redraw
+                && std::time::Instant::now().duration_since(self.last_draw_time) > min_refresh_rate {
                 // redraw periodically to update animations even when no events are occurring
                 // (e.g. cursor blinking, matrix animation)
                 redraw = true;
