@@ -5,7 +5,6 @@ use crate::settings::MouseMode;
 use anyhow::Result;
 use clap_complete::CompletionCandidate;
 use flybuffer::WordDelim;
-use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::ops::Add;
 use std::sync::LazyLock;
@@ -109,6 +108,10 @@ pub enum KeyEventAction {
     RunAgentMode,
     #[strum(message = "Run the agent mode help command")]
     AgentModeRunHelpCommand,
+    #[strum(
+        message = "Ask the agent to fix the buffer, or the previous command if the buffer is empty"
+    )]
+    FixLastCommand,
     #[strum(
         message = "Submit the current command or insert a newline if the buffer is an incomplete expression"
     )]
@@ -540,6 +543,38 @@ impl KeyEventAction {
                 } else {
                     app.show_agent_mode_not_configured_error();
                 }
+            }
+            KeyEventAction::FixLastCommand => {
+                let last_command = app
+                    .long_lived
+                    .history_manager
+                    .entries()
+                    .last()
+                    .map(|entry| entry.command.clone());
+                let Some((agent_cmd, buffer)) = app.resolve_agent_command(false) else {
+                    if app.buffer.buffer().trim().is_empty()
+                        && let Some(last) = last_command
+                    {
+                        app.buffer.replace_buffer(&last);
+                    }
+                    app.show_agent_mode_not_configured_error();
+                    return;
+                };
+                let prompt = if buffer.trim().is_empty() {
+                    let Some(last) = last_command else {
+                        return;
+                    };
+                    app.long_lived
+                        .agent_prompt_history_manager
+                        .push_entry(last.clone());
+                    format!(
+                        "This Bash command exited with status {}. Fix it:\n{last}",
+                        crate::shell::backend().last_command_exit_status()
+                    )
+                } else {
+                    format!("Fix this Bash command:\n{}", buffer.trim())
+                };
+                app.start_agent_mode(agent_cmd, &prompt);
             }
             KeyEventAction::AgentModeRunHelpCommand => {
                 if let ContentMode::AgentError {
@@ -1292,20 +1327,17 @@ fn parse_single_keycode(s: &str) -> Result<KeyCode> {
     }
 }
 
-static MODS_TO_EQUIV_NAMES: LazyLock<HashMap<KeyModifiers, &'static [&'static str]>> =
-    LazyLock::new(|| {
-        HashMap::from([
-            (KeyModifiers::CONTROL, &["ctrl", "control"] as &[&str]),
-            (KeyModifiers::SHIFT, &["shift"] as &[&str]),
-            (KeyModifiers::ALT, &["alt", "option"] as &[&str]),
-            (KeyModifiers::META, &["meta"] as &[&str]),
-            (
-                KeyModifiers::SUPER,
-                &["super", "cmd", "command", "gui", "win"] as &[&str],
-            ),
-            (KeyModifiers::HYPER, &["hyper"] as &[&str]),
-        ])
-    });
+const MODS_TO_EQUIV_NAMES: &[(KeyModifiers, &[&str])] = &[
+    (KeyModifiers::CONTROL, &["ctrl", "control"]),
+    (KeyModifiers::SHIFT, &["shift"]),
+    (KeyModifiers::ALT, &["alt", "option"]),
+    (KeyModifiers::META, &["meta"]),
+    (
+        KeyModifiers::SUPER,
+        &["super", "cmd", "command", "gui", "win"],
+    ),
+    (KeyModifiers::HYPER, &["hyper"]),
+];
 
 /// Parse a single modifier name into a single-bit [`KeyModifiers`] value.
 fn parse_single_modifier(s: &str) -> Result<KeyModifiers> {
@@ -2044,7 +2076,7 @@ pub fn key_sequence_completer(current: &std::ffi::OsStr) -> Vec<CompletionCandid
     let current_lower = current.to_lowercase();
     let mut out = vec![];
 
-    for mod_equivs in MODS_TO_EQUIV_NAMES.values() {
+    for (_, mod_equivs) in MODS_TO_EQUIV_NAMES {
         log::info!(
             "Checking mod_equivs {:?} against used mods {:?}",
             mod_equivs,
@@ -2097,7 +2129,7 @@ pub fn remap_key_completer(current: &std::ffi::OsStr) -> Vec<CompletionCandidate
     let mut out = key_sequence_completer(current);
 
     // 2. Also support remapping standalone modifiers (e.g. "Ctrl", "Alt", "Shift", etc.).
-    for mod_equivs in MODS_TO_EQUIV_NAMES.values() {
+    for (_, mod_equivs) in MODS_TO_EQUIV_NAMES {
         for equiv in *mod_equivs {
             if equiv.to_lowercase().starts_with(&current_lower) {
                 out.push(CompletionCandidate::new(capitalize_first(equiv)));
@@ -2338,8 +2370,21 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
         ),
         Binding::new(
             &expand_variations![M::ALT + KC::Enter.into()],
+            ContextVar::BufferIsEmpty.into(),
+            &[KeyEventAction::FixLastCommand],
+        ),
+        Binding::new(
+            &expand_variations![M::ALT + KC::Enter.into()],
             ContextVar::Always.into(),
             &[KeyEventAction::RunAgentMode],
+        ),
+        Binding::new(
+            &[
+                (M::ALT | M::SHIFT) + KC::Enter.into(),
+                (M::META | M::SHIFT) + KC::Enter.into(),
+            ],
+            ContextVar::Always.into(),
+            &[KeyEventAction::FixLastCommand],
         ),
         Binding::new(
             &expand_variations![KC::Enter.into()],
